@@ -8,7 +8,7 @@ version = "1.0.0"
 description = "A safe and intelligent disk cleaning utility for macOS"
 readme = "README.md"
 authors = [
-    { name = "nmlemus", email = "nmlemus@users.noreply.github.com" }
+    { name = "Noel Moreno Lemus", email = "nmlemus@gmail.com" }
 ]
 license = { text = "MIT" }
 requires-python = ">=3.8"
