@@ -11,6 +11,8 @@ import json
 import re
 import sys
 import platform
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Tuple, Callable, Optional
@@ -349,74 +351,59 @@ def get_docker_reclaimable_bytes() -> int:
 
 
 # -------------------------
-# Discover Categories
+# Category Scanners (for parallel execution)
 # -------------------------
 
-def discover_categories(progress_cb: Optional[Callable] = None) -> List[Category]:
-    """
-    Discover all cleanable categories.
-    Returns list of Category objects.
-    """
-    categories: List[Category] = []
-
-    planned_total = 8
-    step = 0
-
-    # 1) Temporary Files
-    step += 1
-    if progress_cb:
-        progress_cb(step, planned_total)
-    temp_cat = Category(
+def _scan_temp_files() -> Category:
+    """Scan temporary files."""
+    cat = Category(
         _("Temporary Files"),
         _("System and app temporary files")
     )
-    add_if_exists(temp_cat, [
+    add_if_exists(cat, [
         Path("/tmp"),
         Path("/var/tmp"),
         Path("/private/var/tmp"),
         Path("/private/var/folders"),
     ])
-    categories.append(temp_cat)
+    return cat
 
-    # 2) System Log Files
-    step += 1
-    if progress_cb:
-        progress_cb(step, planned_total)
-    logs_cat = Category(
+
+def _scan_logs() -> Category:
+    """Scan system log files."""
+    cat = Category(
         _("System Log Files"),
         _("System and application logs")
     )
-    add_if_exists(logs_cat, [
+    add_if_exists(cat, [
         expand("~/Library/Logs"),
         Path("/var/log"),
         Path("/Library/Logs"),
     ])
-    categories.append(logs_cat)
+    return cat
 
-    # 3) Homebrew Cache
-    step += 1
-    if progress_cb:
-        progress_cb(step, planned_total)
-    brew_cat = Category(
+
+def _scan_homebrew() -> Category:
+    """Scan Homebrew cache."""
+    cat = Category(
         _("Homebrew Cache"),
         _("Homebrew caches and downloads")
     )
-    add_if_exists(brew_cat, [
+    add_if_exists(cat, [
         expand("~/Library/Caches/Homebrew"),
         Path("/Library/Caches/Homebrew"),
         Path("/opt/homebrew/var/homebrew"),
     ])
-    categories.append(brew_cat)
+    return cat
 
-    # 4) Browser Cache
-    step += 1
-    if progress_cb:
-        progress_cb(step, planned_total)
-    browser_cat = Category(
+
+def _scan_browser_cache() -> Category:
+    """Scan browser caches."""
+    cat = Category(
         _("Browser Cache"),
         _("Web browser caches")
     )
-    add_if_exists(browser_cat, [
+    add_if_exists(cat, [
         expand("~/Library/Caches/com.apple.Safari"),
         expand("~/Library/Caches/Google/Chrome"),
         expand("~/Library/Caches/Firefox"),
@@ -424,13 +411,12 @@ def discover_categories(progress_cb: Optional[Callable] = None) -> List[Category
         expand("~/Library/Caches/BraveSoftware"),
         expand("~/Library/Caches/Microsoft Edge"),
     ])
-    categories.append(browser_cat)
+    return cat
 
-    # 5) Node Modules
-    step += 1
-    if progress_cb:
-        progress_cb(step, planned_total)
-    node_cat = Category(
+
+def _scan_node_modules() -> Category:
+    """Scan node_modules directories."""
+    cat = Category(
         _("Node Modules"),
         _("node_modules found in projects")
     )
@@ -442,14 +428,13 @@ def discover_categories(progress_cb: Optional[Callable] = None) -> List[Category
         expand("~/Developer"),
     ]
     dirs = find_node_modules_roots(roots, max_depth=5)
-    add_if_exists(node_cat, dirs)
-    categories.append(node_cat)
+    add_if_exists(cat, dirs)
+    return cat
 
-    # 6) User Cache Files
-    step += 1
-    if progress_cb:
-        progress_cb(step, planned_total)
-    user_cache_cat = Category(
+
+def _scan_user_cache() -> Category:
+    """Scan user cache files."""
+    cat = Category(
         _("User Cache Files"),
         _("User caches (excluding com.apple.*)")
     )
@@ -460,18 +445,17 @@ def discover_categories(progress_cb: Optional[Callable] = None) -> List[Category
                 continue
             size, files = safe_walk(child)
             if size > 0:
-                user_cache_cat.items.append(PathItem(child, size, files))
-    categories.append(user_cache_cat)
+                cat.items.append(PathItem(child, size, files))
+    return cat
 
-    # 7) Development Cache
-    step += 1
-    if progress_cb:
-        progress_cb(step, planned_total)
-    dev_cat = Category(
+
+def _scan_dev_cache() -> Category:
+    """Scan development cache."""
+    cat = Category(
         _("Development Cache"),
         _("Xcode, npm, pip, yarn caches, etc.")
     )
-    add_if_exists(dev_cat, [
+    add_if_exists(cat, [
         expand("~/Library/Developer/Xcode/DerivedData"),
         expand("~/Library/Developer/Xcode/Archives"),
         expand("~/Library/Developer/Xcode/iOS DeviceSupport"),
@@ -483,42 +467,117 @@ def discover_categories(progress_cb: Optional[Callable] = None) -> List[Category
         expand("~/.cargo/registry"),
         expand("~/.gradle/caches"),
     ])
-    categories.append(dev_cat)
+    return cat
 
-    # 8) Docker Data
-    step += 1
-    if progress_cb:
-        progress_cb(step, planned_total)
-    docker_cat = Category(
+
+def _scan_docker() -> Tuple[Category, Optional[str]]:
+    """Scan Docker data. Returns (category, warning_message)."""
+    cat = Category(
         _("Docker Data"),
         _("Unused Docker images and volumes")
     )
+    warning = None
 
     if not docker_is_running():
-        print(color(f"\n[{_('WARNING')}] {_('Docker is not running. Cannot calculate reclaimable space.')}\n", FG_YELLOW))
+        warning = f"[{_('WARNING')}] {_('Docker is not running. Cannot calculate reclaimable space.')}"
         reclaimable = 0
     else:
         reclaimable = get_docker_reclaimable_bytes()
 
-    docker_cat.items.append(
+    cat.items.append(
         PathItem(path=Path("[Docker]"), size_bytes=reclaimable, file_count=0)
     )
-    categories.append(docker_cat)
+    return cat, warning
 
-    return [c for c in categories if c.items]
+
+# -------------------------
+# Discover Categories
+# -------------------------
+
+def discover_categories(progress_cb: Optional[Callable] = None) -> List[Category]:
+    """
+    Discover all cleanable categories using parallel scanning.
+    Returns list of Category objects.
+    """
+    # Define scanner order for consistent display
+    scanner_order = [
+        ("temp", _scan_temp_files),
+        ("logs", _scan_logs),
+        ("homebrew", _scan_homebrew),
+        ("browser", _scan_browser_cache),
+        ("node", _scan_node_modules),
+        ("user_cache", _scan_user_cache),
+        ("dev", _scan_dev_cache),
+        ("docker", _scan_docker),
+    ]
+
+    results: dict = {}
+    docker_warning: Optional[str] = None
+    completed = 0
+    lock = threading.Lock()
+    total = len(scanner_order)
+
+    def run_scanner(name: str, scanner: Callable):
+        nonlocal completed, docker_warning
+        try:
+            result = scanner()
+            # Docker returns a tuple (category, warning)
+            if name == "docker":
+                cat, warning = result
+                if warning:
+                    with lock:
+                        nonlocal docker_warning
+                        docker_warning = warning
+                return name, cat
+            return name, result
+        finally:
+            with lock:
+                nonlocal completed
+                completed += 1
+                if progress_cb:
+                    progress_cb(completed, total)
+
+    # Run scanners in parallel with 4 workers
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        futures = {
+            executor.submit(run_scanner, name, scanner): name
+            for name, scanner in scanner_order
+        }
+        for future in as_completed(futures):
+            name, category = future.result()
+            results[name] = category
+
+    # Print Docker warning if any
+    if docker_warning:
+        print(color(f"\n{docker_warning}\n", FG_YELLOW))
+
+    # Return categories in original order, filtering empty ones
+    categories = []
+    for name, _ in scanner_order:
+        if name in results and results[name].items:
+            categories.append(results[name])
+
+    return categories
 
 
 # =========================
 # UI & Cleanup
 # =========================
 
-def prompt_select_indices(max_index: int, allow_all: bool = True) -> List[int]:
-    """Prompt user to select category indices."""
+def prompt_select_indices(max_index: int, allow_all: bool = True, allow_quit: bool = False) -> Optional[List[int]]:
+    """
+    Prompt user to select category indices.
+    Returns None if user wants to quit (when allow_quit=True).
+    Returns empty list if nothing selected.
+    """
     while True:
         raw = input(color(f"> {_('Selection')}: ", FG_GREEN)).strip().lower()
         if not raw:
             return []
-        if allow_all and raw in ("all", "todo", "todos", "all", "todos"):
+        # Check for quit commands
+        if allow_quit and raw in ("q", "quit", "exit", "salir"):
+            return None
+        if allow_all and raw in ("all", "todo", "todos"):
             return list(range(max_index))
         parts = raw.split(",")
         result = []
@@ -544,22 +603,8 @@ def confirm(prompt: str) -> bool:
     return ans in ("y", "yes", "s", "si", "sí")
 
 
-def interactive_cleanup(dry_run: bool = False):
-    """Interactive cleanup process."""
-    # Check if running on macOS
-    if not is_macos():
-        print(color(_("This tool is designed for macOS only."), FG_RED))
-        sys.exit(1)
-
-    print(bold(color(_("Scanning categories..."), FG_CYAN)))
-
-    categories = discover_categories(progress_cb=print_progress_bar)
-    print()
-
-    if not categories:
-        print(color(_("No categories with data found."), FG_YELLOW))
-        return
-
+def display_categories(categories: List[Category]) -> None:
+    """Display the list of categories with their sizes."""
     print("\n" + bold(_("Categories found:")))
     for i, cat in enumerate(categories, 1):
         print(color(
@@ -567,18 +612,9 @@ def interactive_cleanup(dry_run: bool = False):
             FG_BLUE
         ))
 
-    print(color(f"\n{_('Select categories (e.g., 1,3,5 or all)')}: ", FG_GRAY))
-    indices = prompt_select_indices(len(categories))
 
-    if not indices:
-        print(color(_("Nothing selected."), FG_YELLOW))
-        return
-
-    selected_items: List[PathItem] = []
-    for idx in indices:
-        selected_items.extend(categories[idx].items)
-
-    # Summary
+def display_summary(selected_items: List[PathItem]) -> int:
+    """Display summary of selected items. Returns total size in bytes."""
     total = sum(i.size_bytes for i in selected_items)
     print("\n" + bold("=" * 50))
     print(color(f"{_('Summary')}:", FG_CYAN))
@@ -586,15 +622,11 @@ def interactive_cleanup(dry_run: bool = False):
         print(color(f"- {i.path}  {human_size(i.size_bytes)}", FG_BLUE))
     print(color(f"{_('Total')}: {human_size(total)}", FG_GREEN))
     print(bold("=" * 50))
+    return total
 
-    if dry_run:
-        print(color(_("Dry-run: nothing will be deleted."), FG_YELLOW))
-        return
 
-    if not confirm(_("Delete all of the above?")):
-        print(color(_("Cancelled."), FG_YELLOW))
-        return
-
+def cleanup_selected(selected_items: List[PathItem]) -> None:
+    """Execute cleanup for selected items."""
     print(color(f"\n{_('Starting deletion...')}", FG_CYAN))
 
     for item in selected_items:
@@ -645,6 +677,71 @@ def interactive_cleanup(dry_run: bool = False):
                 print(color(f"[{_('ERROR')}] {p}: {e}", FG_RED))
 
     print(color(f"\n{_('Cleanup completed.')}", FG_GREEN))
+
+
+def interactive_cleanup(dry_run: bool = False):
+    """Interactive cleanup process with loop to continue cleaning."""
+    # Check if running on macOS
+    if not is_macos():
+        print(color(_("This tool is designed for macOS only."), FG_RED))
+        sys.exit(1)
+
+    first_scan = True
+
+    while True:
+        # Scan categories
+        if first_scan:
+            print(bold(color(_("Scanning categories..."), FG_CYAN)))
+        else:
+            print(bold(color(f"\n{_('Refreshing categories...')}", FG_CYAN)))
+
+        categories = discover_categories(progress_cb=print_progress_bar)
+        print()
+        first_scan = False
+
+        if not categories:
+            print(color(_("No categories with data found."), FG_YELLOW))
+            break
+
+        # Display categories
+        display_categories(categories)
+
+        # Prompt for selection (with quit option)
+        print(color(f"\n{_('Select categories (e.g., 1,3,5 or all, q to quit)')}: ", FG_GRAY))
+        indices = prompt_select_indices(len(categories), allow_quit=True)
+
+        # User wants to quit
+        if indices is None:
+            print(color(f"\n{_('Goodbye!')}", FG_GREEN))
+            break
+
+        # Nothing selected, continue loop
+        if not indices:
+            print(color(_("Nothing selected."), FG_YELLOW))
+            continue
+
+        # Gather selected items
+        selected_items: List[PathItem] = []
+        for idx in indices:
+            selected_items.extend(categories[idx].items)
+
+        # Display summary
+        display_summary(selected_items)
+
+        # Handle dry-run mode
+        if dry_run:
+            print(color(_("Dry-run: nothing will be deleted."), FG_YELLOW))
+            continue
+
+        # Confirm deletion
+        if not confirm(_("Delete all of the above?")):
+            print(color(_("Cancelled."), FG_YELLOW))
+            continue
+
+        # Execute cleanup
+        cleanup_selected(selected_items)
+
+        # Loop continues - will rescan and show updated sizes
 
 
 # =========================
