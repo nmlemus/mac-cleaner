@@ -8,7 +8,7 @@ This package helps you reclaim disk space by identifying and cleaning:
 - Development caches (node_modules, Homebrew, Docker, etc.)
 """
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 __author__ = "nmlemus"
 __license__ = "MIT"
 
